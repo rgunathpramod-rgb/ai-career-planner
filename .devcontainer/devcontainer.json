@@ -1,0 +1,29 @@
+{
+  "name": "AI Career Planner (Techolas weekend build)",
+  "image": "ghcr.io/techolas-git/ai-career-planner-env:latest",
+  "customizations": {
+    "codespaces": {
+      "openFiles": [
+        "PROMPTS.md",
+        "app.py"
+      ]
+    },
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "GitHub.copilot",
+        "GitHub.copilot-chat"
+      ]
+    }
+  },
+  "postAttachCommand": "(python -c 'import streamlit, google.genai' 2>/dev/null || pip install --user --timeout 90 --retries 5 -q -r requirements.txt) && python -m streamlit run app.py --server.headless true --server.enableCORS false --server.enableXsrfProtection false",
+  "portsAttributes": {
+    "8501": {
+      "label": "My AI app",
+      "onAutoForward": "openPreview"
+    }
+  },
+  "forwardPorts": [
+    8501
+  ]
+}
