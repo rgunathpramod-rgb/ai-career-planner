@@ -13,9 +13,9 @@ from google.genai import errors, types
 # ---------------------------------------------------------------------------
 # 1. SETUP
 # ---------------------------------------------------------------------------
-# Models are tried in order. If one is busy (503) or out of free quota (429),
-# the app retries it once, then moves on to the next one.
-MODELS = ["gemini-3.8-flash", "gemini-2.5-flash-lite", "gemini-flash-lite-latest"]
+# If the main model is busy, retry it once and then use the lite model.
+PRIMARY_MODEL = "gemini-3.5-flash-lite"
+FALLBACK_MODEL = "gemini-3.5-flash-lite-lite"
 TEMPORARY_ERRORS = {429, 500, 503, 504}
 MAX_RESUME_MB = 15  # Gemini accepts files sent this way up to about 20 MB
 
@@ -138,18 +138,20 @@ def call_gemini(contents, config):
         # google-genai 3.x defaults to the v1 API, which rejects system_instruction.
         http_options=types.HttpOptions(api_version="v1beta"),
     )
-    last_error = None
-    for model in MODELS:
-        for attempt in range(2):
-            try:
-                return client.models.generate_content(model=model, contents=contents, config=config)
-            except errors.APIError as e:
-                if e.code not in TEMPORARY_ERRORS:
-                    raise  # e.g. a bad key: retrying will not help
-                last_error = e
-                if attempt == 0:
-                    time.sleep(2)
-    raise last_error
+    for attempt in range(2):
+        try:
+            return client.models.generate_content(
+                model=PRIMARY_MODEL, contents=contents, config=config
+            )
+        except errors.APIError as e:
+            if e.code not in TEMPORARY_ERRORS:
+                raise  # e.g. a bad key: retrying will not help
+            if attempt == 0:
+                time.sleep(2)
+
+    return client.models.generate_content(
+        model=FALLBACK_MODEL, contents=contents, config=config
+    )
 
 
 def make_plan(profile_text, pdf_bytes):
@@ -242,9 +244,8 @@ st.markdown(
 with st.container(border=True):
     st.markdown('<div class="step">Step 1 · Resume (optional)</div>', unsafe_allow_html=True)
     resume = st.file_uploader("Upload your resume (optional)", type="pdf", label_visibility="collapsed")
-    st.caption("Your resume is sent to Google Gemini to make your plan and is not stored by this app. "
-               "On Gemini's free tier Google may use it to improve its products, so upload only "
-               "what you're comfortable sharing.")
+    st.caption("Your resume is sent to Google Gemini to make your plan and is not stored by "
+               "this app. On Gemini's free tier Google may use it to improve its products.")
     resume_bytes = resume.getvalue() if resume else None
     if resume_bytes and len(resume_bytes) > MAX_RESUME_MB * 1024 * 1024:
         st.warning(f"That PDF is over {MAX_RESUME_MB} MB. Please upload a smaller file.")
