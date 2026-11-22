@@ -5,6 +5,8 @@
 
 import json
 import time
+import uuid
+from pathlib import Path
 
 import streamlit as st
 from google import genai
@@ -128,6 +130,23 @@ PLAN_SCHEMA = S(
 
 ROADMAP_TABS = [("days_1_30", "Days 1-30"), ("days_31_60", "Days 31-60"), ("days_61_90", "Days 61-90")]
 
+# These preferences are saved on this computer so they remain after the app closes.
+PREFERENCE_CATEGORIES = {
+    "likes": "❤️ Likes",
+    "dislikes": "👎 Dislikes",
+    "least_interested_in": "🎯 Least Interested In",
+    "strongest_interests": "⭐ Strongest Interests",
+}
+PREFERENCES_FILE = Path.home() / ".ai_career_planner_preferences.json"
+PREFERENCES_SCHEMA = S(
+    type=T.OBJECT,
+    properties={
+        key: S(type=T.ARRAY, items=S(type=T.STRING), max_items=5)
+        for key in PREFERENCE_CATEGORIES
+    },
+    required=list(PREFERENCE_CATEGORIES),
+)
+
 # ---------------------------------------------------------------------------
 # 4. TALKING TO GEMINI
 # ---------------------------------------------------------------------------
@@ -178,6 +197,75 @@ def answer_followup(plan, history, question):
     contents = f"Career plan:\n{json.dumps(plan)}\n\nEarlier chat:\n{chat}\n\nNew question: {question}"
     config = types.GenerateContentConfig(system_instruction=FOLLOWUP_PROMPT, temperature=0.7)
     return call_gemini(contents, config).text or "Sorry, I could not answer that. Please try again."
+
+
+# Load and save preferences separately from AI-generated suggestions.
+def empty_preferences():
+    return {
+        "user_provided": {key: [] for key in PREFERENCE_CATEGORIES},
+        "ai_generated": {key: [] for key in PREFERENCE_CATEGORIES},
+    }
+
+
+def load_preferences():
+    if not PREFERENCES_FILE.exists():
+        return empty_preferences()
+
+    saved = json.loads(PREFERENCES_FILE.read_text(encoding="utf-8"))
+    if not isinstance(saved, dict):
+        raise ValueError("The preferences file has an invalid format.")
+    for section in ("user_provided", "ai_generated"):
+        if not isinstance(saved.get(section), dict):
+            raise ValueError("The preferences file has an invalid format.")
+        for key in PREFERENCE_CATEGORIES:
+            if not isinstance(saved[section].get(key), list):
+                raise ValueError("The preferences file has an invalid format.")
+            if section == "user_provided":
+                for item in saved[section][key]:
+                    if not isinstance(item, dict) or not all(
+                        isinstance(item.get(field), str) for field in ("id", "text")
+                    ):
+                        raise ValueError("The preferences file has an invalid format.")
+            elif not all(isinstance(item, str) for item in saved[section][key]):
+                raise ValueError("The preferences file has an invalid format.")
+    return saved
+
+
+def save_preferences(preferences):
+    PREFERENCES_FILE.write_text(
+        json.dumps(preferences, ensure_ascii=True, indent=2),
+        encoding="utf-8",
+    )
+
+
+# Ask Gemini to find patterns in the profile, plan and follow-up chat.
+def analyze_preferences(profile_text, plan, history, user_preferences):
+    prompt = {
+        "profile": profile_text,
+        "career_plan": plan,
+        "user_follow_up_questions": [
+            text for who, text in history if who == "You"
+        ],
+        "user_provided_preferences": {
+            key: [item["text"] for item in items]
+            for key, items in user_preferences.items()
+        },
+    }
+    instructions = """Review this person's profile, career plan and follow-up interactions.
+Return brief, evidence-based phrases in each category: likes, dislikes, least_interested_in,
+and strongest_interests. Use only what the person said or repeatedly chose. Do not treat
+AI-generated plan content as proof of a preference. Leave a category empty if there is not
+enough evidence. Do not invent personal details or promise a job or salary."""
+    config = types.GenerateContentConfig(
+        system_instruction=instructions,
+        temperature=0.4,
+        response_mime_type="application/json",
+        response_schema=PREFERENCES_SCHEMA,
+    )
+    response = call_gemini(json.dumps(prompt), config)
+    if not response.text:
+        raise ValueError("empty answer")
+    return json.loads(response.text)
 
 
 def friendly_error(e):
@@ -362,14 +450,136 @@ if "plan" in st.session_state:
     for g in gaps:
         chart_box.markdown(f"- **{g['skill']}:** {g['free_resource']}")
 
-    # 90-day roadmap: one tab per month, tasks as checkboxes
+    # The roadmap stays first, with a separate tab for personal preferences.
     st.subheader("🗓️ Your 90-day roadmap")
-    for tab, (key, label) in zip(st.tabs([label for _, label in ROADMAP_TABS]), ROADMAP_TABS):
-        with tab:
-            block = plan["roadmap"][key]
-            for i, task in enumerate(block["tasks"]):
-                st.checkbox(task, key=f"task_{plan_id}_{key}_{i}")
-            st.info(f"🛠️ **Mini project:** {block['mini_project']}")
+    roadmap_view, preferences_view = st.tabs(["🗓️ Roadmap", "❤️ Likes / Dislikes"])
+    with roadmap_view:
+        for tab, (key, label) in zip(
+            st.tabs([label for _, label in ROADMAP_TABS]), ROADMAP_TABS
+        ):
+            with tab:
+                block = plan["roadmap"][key]
+                for i, task in enumerate(block["tasks"]):
+                    st.checkbox(task, key=f"task_{plan_id}_{key}_{i}")
+                st.info(f"🛠️ **Mini project:** {block['mini_project']}")
+
+    # Keep personal entries editable and show Gemini's suggestions separately.
+    with preferences_view:
+        st.caption(
+            "Your entries are saved on this computer. Gemini's insights are suggestions "
+            "and are stored separately."
+        )
+        try:
+            preferences = load_preferences()
+        except (OSError, ValueError) as e:
+            preferences = None
+            st.error(f"Could not read your saved preferences: {e}")
+
+        if preferences is not None:
+            if st.button("✨ Analyze my profile and interactions", key="analyze_preferences"):
+                error = None
+                with st.spinner("Looking for patterns in your profile..."):
+                    try:
+                        generated = analyze_preferences(
+                            build_profile(),
+                            plan,
+                            st.session_state["followups"],
+                            preferences["user_provided"],
+                        )
+                        updated_preferences = {
+                            **preferences,
+                            "ai_generated": generated,
+                        }
+                        save_preferences(updated_preferences)
+                        preferences = updated_preferences
+                    except Exception as e:
+                        error = friendly_error(e)
+                if error:
+                    st.error(error)
+
+            with st.form("add_preference", clear_on_submit=True):
+                add_category = st.selectbox(
+                    "Preference type",
+                    list(PREFERENCE_CATEGORIES),
+                    format_func=lambda key: PREFERENCE_CATEGORIES[key],
+                )
+                add_text = st.text_input("Add something you like or prefer")
+                add_submitted = st.form_submit_button("➕ Add preference")
+            if add_submitted:
+                if not add_text.strip():
+                    st.warning("Type a preference before adding it.")
+                else:
+                    updated_preferences = {
+                        **preferences,
+                        "user_provided": {
+                            key: list(items)
+                            for key, items in preferences["user_provided"].items()
+                        },
+                    }
+                    updated_preferences["user_provided"][add_category].append(
+                        {"id": uuid.uuid4().hex, "text": add_text.strip()}
+                    )
+                    try:
+                        save_preferences(updated_preferences)
+                    except OSError as e:
+                        st.error(f"Could not save your preference: {e}")
+                    else:
+                        preferences = updated_preferences
+                        st.success("Your preference was saved.")
+
+            for category, label in PREFERENCE_CATEGORIES.items():
+                st.markdown(f"### {label}")
+                st.markdown("**You provided**")
+                entries = preferences["user_provided"][category]
+                if not entries:
+                    st.caption("No preferences added yet.")
+                for entry in entries:
+                    with st.form(f"edit_preference_{entry['id']}"):
+                        edit_column, save_column, remove_column = st.columns(
+                            [6, 1, 1]
+                        )
+                        edited_text = edit_column.text_input(
+                            "Your preference",
+                            value=entry["text"],
+                            key=f"preference_text_{entry['id']}",
+                        )
+                        save_entry = save_column.form_submit_button("Save")
+                        remove_entry = remove_column.form_submit_button("Remove")
+                    if save_entry or remove_entry:
+                        updated_preferences = {
+                            **preferences,
+                            "user_provided": {
+                                key: [dict(item) for item in items]
+                                for key, items in preferences["user_provided"].items()
+                            },
+                        }
+                        updated_entries = updated_preferences["user_provided"][category]
+                        if remove_entry:
+                            updated_entries[:] = [
+                                item for item in updated_entries if item["id"] != entry["id"]
+                            ]
+                        elif edited_text.strip():
+                            for item in updated_entries:
+                                if item["id"] == entry["id"]:
+                                    item["text"] = edited_text.strip()
+                                    break
+                        else:
+                            st.warning("A preference cannot be blank.")
+                            continue
+                        try:
+                            save_preferences(updated_preferences)
+                        except OSError as e:
+                            st.error(f"Could not save your change: {e}")
+                        else:
+                            st.rerun()
+
+                st.markdown("**AI-generated insights**")
+                insights = preferences["ai_generated"][category]
+                if insights:
+                    for insight in insights:
+                        st.markdown(f"- {insight}")
+                else:
+                    st.caption("No AI insights yet. Use the analyze button above.")
 
     # Download the plan as a Markdown file
     st.download_button(
